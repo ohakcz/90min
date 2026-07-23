@@ -35,10 +35,11 @@ server {
     }
 
     location ~ \.php\$ {
-        try_files \$uri =404;
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:${PHP_SOCK};
         fastcgi_param HTTP_X_FORWARDED_PROTO https;
+        fastcgi_param HTTP_X_FORWARDED_HOST dev.90min.cz;
+        fastcgi_param HTTP_X_FORWARDED_PREFIX /admin/shop;
     }
 
     location ~* /\.(?!well-known/) {
@@ -58,9 +59,10 @@ location /admin/shop/ {
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Forwarded-Prefix /admin/shop;
     proxy_pass http://127.0.0.1:8099/;
-    proxy_redirect off;
+    proxy_redirect http://127.0.0.1:8099/ /admin/shop/;
 }
 EOF
 
@@ -145,12 +147,45 @@ chmod 640 "$WP_PATH/wp-config.php"
 
 wp plugin activate woocommerce packeta --path="$WP_PATH" --allow-root >/dev/null 2>&1 || true
 
+# WordPress musí znát veřejnou cestu pod /admin/shop.
+wp option update home "$WP_URL" --path="$WP_PATH" --allow-root >/dev/null
+wp option update siteurl "$WP_URL" --path="$WP_PATH" --allow-root >/dev/null
+
+# Zabraňuje přesměrování na interní port při reverse proxy.
+if ! grep -q "90MIN_SHOP_PROXY_FIX" "$WP_PATH/wp-config.php"; then
+  python3 - "$WP_PATH/wp-config.php" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+marker = "/* That's all, stop editing! Happy publishing. */"
+block = r'''// 90MIN_SHOP_PROXY_FIX
+if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+    $_SERVER['HTTPS'] = 'on';
+}
+if (!empty($_SERVER['HTTP_X_FORWARDED_HOST'])) {
+    $_SERVER['HTTP_HOST'] = $_SERVER['HTTP_X_FORWARDED_HOST'];
+}
+'''
+if marker in s:
+    s = s.replace(marker, block + "\n" + marker, 1)
+else:
+    s += "\n" + block
+p.write_text(s)
+PY
+fi
+
 echo "=== Ověření WordPressu a pluginů ==="
 wp core is-installed --path="$WP_PATH" --allow-root && echo "WordPress: OK"
 wp plugin list --path="$WP_PATH" --allow-root --fields=name,status,version --format=table | grep -E 'woocommerce|packeta' || true
 
 echo "=== Ověření HTTP ==="
-curl -kfsSI "${WP_URL}/wp-login.php" | head -n 1 || true
+HTTP_CODE="$(curl -ksS -o /dev/null -w '%{http_code}' "${WP_URL}/wp-login.php")"
+echo "${WP_URL}/wp-login.php -> HTTP ${HTTP_CODE}"
+if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "302" ]]; then
+  echo "CHYBA: shop backend neodpovídá správně." >&2
+  exit 1
+fi
 
 echo
 echo "HOTOVO: ${WP_URL}/wp-admin/"
